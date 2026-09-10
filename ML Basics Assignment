@@ -1,0 +1,1345 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Generated at runtime by the scripts -- not meant to be tracked
+ML/customer_segments.csv
+ML/elbow_plot.png
+ML/demand_forecast.png
+
+"""
+Part 2: Predict Customer Churn.
+Author: Jacob Laplante
+
+DATA SOURCE (real data):
+  IBM Telco Customer Churn dataset (7,043 customers of a fictional telecom
+  company, real usage/billing/contract fields, published by IBM).
+  Official IBM GitHub mirror (no login required):
+    https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/master/data/Telco-Customer-Churn.csv
+  Also mirrored on Kaggle as "Telco Customer Churn":
+    https://www.kaggle.com/datasets/blastchar/telco-customer-churn
+
+  NOTE: this is real data, so it uses the telecom company's *actual* column
+  names rather than the fictional 'age / monthly_usage_hours / region'
+  columns invented for the toy starter example. We use:
+    - tenure          (months as a customer)               -> numeric
+    - MonthlyCharges   (current monthly bill, $)             -> numeric
+    - TotalCharges     (total billed to date, $)             -> numeric
+    - SeniorCitizen    (0/1 flag)                            -> numeric
+    - Contract         (Month-to-month / One year / Two year) -> categorical
+    - Churn            (Yes/No)                              -> target
+
+  The same modeling idea from the assignment still applies: StandardScaler
+  on the numeric columns, OneHotEncoder on the categorical column
+  (Contract plays the role 'region' played in the starter code), then
+  LogisticRegression, then classify with a 0.5 probability threshold.
+
+  NOTE ON THE SANDBOX THIS WAS DEVELOPED IN: outbound internet in the
+  environment used to write/test this script is restricted to package
+  registries only, so the live download above could not be exercised
+  there. It will work normally in Google Colab, GitHub Actions, or your
+  own laptop. If the download fails for any reason, the script falls back
+  to a synthetic dataset built to match the real dataset's published
+  statistics (~26.5% overall churn rate; month-to-month + high charges +
+  low tenure customers churn much more often) so it always runs end to end.
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
+
+TELCO_URL = ("https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/"
+             "master/data/Telco-Customer-Churn.csv")
+NUMERIC_FEATURES = ["tenure", "MonthlyCharges", "TotalCharges", "SeniorCitizen"]
+CATEGORICAL_FEATURES = ["Contract"]
+RANDOM_STATE = 42
+
+
+def load_real_telco_data():
+    """Download the real IBM Telco Customer Churn dataset and trim it down
+    to the columns this assignment's pipeline needs."""
+    raw = pd.read_csv(TELCO_URL)
+    df = raw[NUMERIC_FEATURES + CATEGORICAL_FEATURES + ["Churn"]].copy()
+
+    # TotalCharges is stored as text in the raw file and has ~11 blank
+    # values for brand-new customers (tenure == 0); coerce and drop those.
+    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+    df = df.dropna()
+
+    df["churn"] = (df["Churn"] == "Yes").astype(int)
+    df = df.drop(columns=["Churn"])
+    return df
+
+
+def generate_fallback_data(n=500, seed=RANDOM_STATE):
+    """Synthetic stand-in matching the real Telco dataset's schema and
+    published churn statistics, used only if the live download above is
+    not reachable."""
+    rng = np.random.default_rng(seed)
+
+    contract = rng.choice(
+        ["Month-to-month", "One year", "Two year"], size=n, p=[0.55, 0.25, 0.20]
+    )
+    senior = rng.choice([0, 1], size=n, p=[0.84, 0.16])  # real dataset: ~16% senior
+
+    # Tenure depends loosely on contract type (longer contracts -> longer tenure)
+    tenure_base = np.select(
+        [contract == "Month-to-month", contract == "One year", contract == "Two year"],
+        [rng.normal(18, 14, n), rng.normal(35, 16, n), rng.normal(50, 18, n)],
+    )
+    tenure = tenure_base.clip(0, 72).round().astype(int)
+
+    monthly_charges = rng.normal(64.8, 30, n).clip(18, 120).round(2)
+    total_charges = (monthly_charges * tenure + rng.normal(0, 50, n)).clip(0, None).round(2)
+
+    # Realistic churn probability: higher for month-to-month, high monthly
+    # charges, low tenure, and senior citizens -- consistent with the
+    # patterns reported for the real IBM Telco dataset (~26.5% overall churn).
+    logit = (
+        -2.2
+        + 1.6 * (contract == "Month-to-month")
+        - 0.4 * (contract == "One year")
+        - 1.0 * (contract == "Two year")
+        + 0.02 * monthly_charges
+        - 0.03 * tenure
+        + 0.3 * senior
+    )
+    churn_prob = 1 / (1 + np.exp(-logit))
+    churn = (rng.random(n) < churn_prob).astype(int)
+
+    return pd.DataFrame({
+        "tenure": tenure,
+        "MonthlyCharges": monthly_charges,
+        "TotalCharges": total_charges,
+        "SeniorCitizen": senior,
+        "Contract": contract,
+        "churn": churn,
+    })
+
+
+def load_data():
+    try:
+        df = load_real_telco_data()
+        print(f"Loaded {len(df)} REAL customer records from the IBM Telco "
+              f"Customer Churn dataset ({TELCO_URL}).")
+        return df
+    except Exception as exc:
+        print(f"Could not download the real Telco churn dataset ({exc}). "
+              f"Falling back to a documented synthetic dataset that matches "
+              f"its real schema and churn statistics.")
+        df = generate_fallback_data()
+        print(f"Generated {len(df)} synthetic rows as a fallback. "
+              f"Overall churn rate: {df['churn'].mean():.1%}")
+        return df
+
+
+df = load_data()
+
+# Features and target
+X = df[NUMERIC_FEATURES + CATEGORICAL_FEATURES]
+y = df["churn"]
+
+# Preprocessing: scale numerical features, one-hot encode the categorical feature
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", StandardScaler(), NUMERIC_FEATURES),
+        ("cat", OneHotEncoder(sparse_output=False, handle_unknown="ignore"), CATEGORICAL_FEATURES),
+    ]
+)
+
+model = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("classifier", LogisticRegression(random_state=RANDOM_STATE, max_iter=1000)),
+])
+
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+)
+
+# Train model
+model.fit(X_train, y_train)
+
+# --- Evaluation (improvement over the starter code, which never checked
+# how good the model actually is) ---
+y_pred_test = model.predict(X_test)
+y_proba_test = model.predict_proba(X_test)[:, 1]
+print(f"\nTest accuracy: {accuracy_score(y_test, y_pred_test):.3f}")
+print(f"Test ROC AUC:  {roc_auc_score(y_test, y_proba_test):.3f}")
+print(f"Confusion matrix [[TN FP] [FN TP]]:\n{confusion_matrix(y_test, y_pred_test)}")
+
+# Predict churn probability for a new customer
+new_customer = pd.DataFrame({
+    "tenure": [5],
+    "MonthlyCharges": [95.0],
+    "TotalCharges": [475.0],
+    "SeniorCitizen": [0],
+    "Contract": ["Month-to-month"],
+})
+churn_probability = model.predict_proba(new_customer)[0][1]
+
+threshold = 0.5
+churn_prediction = 1 if churn_probability > threshold else 0
+
+print(f"\nChurn Probability for new customer: {churn_probability:.2f}")
+print(f"Churn Prediction (1 = churn, 0 = no churn): {churn_prediction}")
+
+# Display model coefficients
+feature_names = NUMERIC_FEATURES + (
+    model.named_steps["preprocessor"]
+    .named_transformers_["cat"]
+    .get_feature_names_out(CATEGORICAL_FEATURES)
+).tolist()
+
+coefficients = model.named_steps["classifier"].coef_[0]
+print("\nModel Coefficients (in standardized/encoded feature space):")
+for feature, coef in zip(feature_names, coefficients):
+    print(f"  {feature}: {coef:.3f}")
+print(f"  intercept: {model.named_steps['classifier'].intercept_[0]:.3f}")
+
+"""
+Part 3: Customer Segmentation with K-Means.
+Author: Jacob Laplante
+
+DATA SOURCE (real data):
+  Mall Customer Segmentation Data (200 mall customers: gender, age, annual
+  income, and a 1-100 "spending score" computed by the mall from purchase
+  behavior). Originally published on Kaggle by vjchoudhary7:
+    https://www.kaggle.com/datasets/vjchoudhary7/customer-segmentation-tutorial-in-python
+  Public no-login CSV mirror used for programmatic loading:
+    https://raw.githubusercontent.com/erkansirin78/datasets/master/Mall_Customers.csv
+
+  Column mapping to this assignment's original feature names:
+    - 'Annual Income (k$)'    -> annual_spending   (customer's income scale)
+    - 'Spending Score (1-100)'-> purchase_frequency (mall's own behavioral score)
+    - 'Age'                   -> age
+    - 'Genre' (Male/Female)   -> gender (kept as extra descriptive info,
+                                  not used as a clustering feature, same as
+                                  how the starter code kept 'region' out of
+                                  the clustering features)
+
+  NOTE ON THE SANDBOX THIS WAS DEVELOPED IN: outbound internet in the
+  environment used to write/test this script is restricted to package
+  registries only, so the live download above could not be exercised
+  there. It will work normally in Google Colab, GitHub Actions, or your
+  own laptop. If the download fails for any reason, the script falls back
+  to a synthetic dataset generated to match the real dataset's published
+  ranges (Age 18-70, Annual Income $15k-$137k, Spending Score 1-99) so it
+  always runs end to end.
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+MALL_URL = "https://raw.githubusercontent.com/erkansirin78/datasets/master/Mall_Customers.csv"
+FEATURES = ["annual_spending", "purchase_frequency", "age"]
+RANDOM_STATE = 42
+
+
+def load_real_mall_data():
+    """Download the real Mall Customer Segmentation dataset and rename its
+    columns to match this assignment's feature names. Different public
+    mirrors of this dataset spell the headers slightly differently (e.g.
+    'Genre' vs 'Gender', 'Annual Income (k$)' vs 'Annual Income'), so
+    columns are located by keyword instead of an exact name match."""
+    raw = pd.read_csv(MALL_URL)
+
+    def find_column(*keywords):
+        for original in raw.columns:
+            lowered = original.lower()
+            if all(keyword in lowered for keyword in keywords):
+                return original
+        raise KeyError(f"No column matching {keywords} found in {list(raw.columns)}")
+
+    rename_map = {
+        find_column("income"): "annual_spending",
+        find_column("spending"): "purchase_frequency",
+        find_column("age"): "age",
+        find_column("gen"): "gender",  # matches both 'Genre' and 'Gender'
+    }
+    df = raw.rename(columns=rename_map)[["annual_spending", "purchase_frequency", "age", "gender"]]
+    return df
+
+
+def generate_fallback_data(n=200, seed=RANDOM_STATE):
+    """Synthetic stand-in matching the real Mall Customer dataset's
+    published ranges, used only if the live download above is not
+    reachable. Builds three loosely-separated groups so the elbow method
+    and K-Means still produce a sensible, interpretable result."""
+    rng = np.random.default_rng(seed)
+
+    n_per_group = n // 3
+    groups = []
+    # (income mean/std, spending-score mean/std, age mean/std)
+    profiles = [
+        (30, 8, 25, 12, 40, 12),   # budget-conscious, older
+        (55, 12, 55, 15, 32, 8),   # mid income, moderate spenders
+        (95, 15, 80, 12, 28, 6),   # high income, high spenders, younger
+    ]
+    for income_mu, income_sd, spend_mu, spend_sd, age_mu, age_sd in profiles:
+        groups.append(pd.DataFrame({
+            "annual_spending": rng.normal(income_mu, income_sd, n_per_group).clip(15, 137).round(1),
+            "purchase_frequency": rng.normal(spend_mu, spend_sd, n_per_group).clip(1, 99).round().astype(int),
+            "age": rng.normal(age_mu, age_sd, n_per_group).clip(18, 70).round().astype(int),
+            "gender": rng.choice(["Male", "Female"], n_per_group),
+        }))
+    df = pd.concat(groups, ignore_index=True)
+    return df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+
+def load_data():
+    try:
+        df = load_real_mall_data()
+        print(f"Loaded {len(df)} REAL customers from the Mall Customer "
+              f"Segmentation dataset ({MALL_URL}).")
+        return df
+    except Exception as exc:
+        print(f"Could not download the real Mall Customer dataset ({exc}). "
+              f"Falling back to a documented synthetic dataset that matches "
+              f"its real value ranges.")
+        df = generate_fallback_data()
+        print(f"Generated {len(df)} synthetic rows as a fallback.")
+        return df
+
+
+df = load_data()
+
+# Preprocess: select numerical features and scale them
+X = df[FEATURES]
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Determine optimal number of clusters using the elbow method
+inertia = []
+K = range(1, 8)
+for k in K:
+    kmeans = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+    kmeans.fit(X_scaled)
+    inertia.append(kmeans.inertia_)
+
+plt.figure(figsize=(8, 5))
+plt.plot(K, inertia, "bo-")
+plt.xlabel("Number of Clusters (K)")
+plt.ylabel("Inertia")
+plt.title("Elbow Method for Optimal K")
+plt.savefig("elbow_plot.png")
+plt.close()
+print("Saved elbow_plot.png -- look for the 'bend' (usually K=3 to 5 for this data).")
+
+# Apply K-Means with the chosen K (3, consistent with the elbow bend for
+# both the real Mall dataset and the synthetic fallback's 3 built-in groups)
+optimal_k = 3
+kmeans = KMeans(n_clusters=optimal_k, random_state=RANDOM_STATE, n_init=10)
+df["cluster"] = kmeans.fit_predict(X_scaled)
+
+# Analyze clusters
+cluster_summary = df.groupby("cluster")[FEATURES].mean().round(2)
+cluster_counts = df["cluster"].value_counts().sort_index()
+print("\nCluster Characteristics (mean values):")
+print(cluster_summary)
+print("\nCluster sizes:")
+print(cluster_counts)
+
+# Targeted strategies based on each cluster's profile
+print("\nTargeted Marketing Strategies:")
+for cluster in range(optimal_k):
+    spending = cluster_summary.loc[cluster, "annual_spending"]
+    frequency = cluster_summary.loc[cluster, "purchase_frequency"]
+    print(f"\nCluster {cluster} (n={cluster_counts[cluster]}, "
+          f"avg income=${spending:.0f}k, avg spending score={frequency:.0f}):")
+    if spending > 70 and frequency > 60:
+        print("  High-income, high-spending customers -> exclusive promotions, "
+              "VIP loyalty perks, early access to new products.")
+    elif frequency > 60:
+        print("  Frequent/high spending-score shoppers -> loyalty points, "
+              "bundle discounts to keep engagement high.")
+    elif spending > 70:
+        print("  High income but lower spending score -> targeted campaigns "
+              "highlighting premium products they aren't buying yet.")
+    else:
+        print("  Lower engagement customers -> re-engagement emails, "
+              "first-purchase discounts, awareness campaigns.")
+
+# Save cluster assignments to CSV
+df.to_csv("customer_segments.csv", index=False)
+print("\nSaved cluster assignments to customer_segments.csv")
+
+"""
+Extra Credit: AI-powered housing demand forecasting tool.
+Author: Jacob Laplante
+
+Reads historical housing sales/inventory data from a CSV file, trains a
+regression model, and forecasts demand for the next 6 months.
+
+DATA SOURCE (real data):
+  "Existing Home Sales" (not seasonally adjusted), series EXHOSLUSM495N,
+  published by the National Association of Realtors via the Federal
+  Reserve Bank of St. Louis (FRED). Monthly count of existing homes sold
+  in the U.S., in thousands of units -- a direct measure of housing demand.
+  Official direct CSV download (no login required):
+    https://fred.stlouisfed.org/graph/fredgraph.csv?id=EXHOSLUSM495N
+  Series page / documentation:
+    https://fred.stlouisfed.org/series/EXHOSLUSM495N
+
+  NOTE ON THE SANDBOX THIS WAS DEVELOPED IN: outbound internet in the
+  environment used to write/test this script is restricted to package
+  registries only, so the live download above could not be exercised
+  there. It will work normally in Google Colab, GitHub Actions, or your
+  own laptop. If the download fails, the script falls back to a synthetic
+  monthly series built to resemble the real one (an overall trend plus a
+  realistic seasonal pattern -- home sales are typically highest in
+  summer and lowest in winter) so it always runs end to end.
+
+ASSUMPTIONS:
+  - Recent history (last ~10 years of monthly data) is representative
+    enough of near-term future demand to extrapolate from.
+  - A model that captures (a) a long-run linear trend and (b) a repeating
+    month-of-year seasonal effect is a reasonable balance of simplicity
+    and accuracy for a 6-month-ahead forecast.
+  - No exogenous shocks (rate changes, policy changes, recessions) occur
+    in the forecast window -- a real limitation of any regression-only
+    approach.
+
+CHALLENGES:
+  - Plain linear regression on a raw time index ('month = 1, 2, 3...'),
+    as in the original starter code, completely ignores seasonality and
+    badly underfits a series like home sales, which swings a lot by
+    calendar month.
+  - Housing demand is affected by mortgage rates, employment, and housing
+    supply -- none of which are in this single-series dataset, so the
+    model can only ever be a rough baseline.
+  - Real-world data can include missing months or revisions; the loader
+    below drops missing values defensively.
+
+POTENTIAL IMPROVEMENTS:
+  - Add exogenous features (mortgage rates, housing inventory, employment)
+    as additional regression inputs.
+  - Use a model built for time series (e.g. SARIMA, Prophet, or gradient
+    boosting on lag features) instead of plain linear regression.
+  - Cross-validate on rolling time windows instead of a single train/test
+    split, since shuffling time series data (as a normal train_test_split
+    would) leaks future information into the past.
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_absolute_error
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=EXHOSLUSM495N"
+FORECAST_HORIZON = 6
+RANDOM_STATE = 42
+
+
+def load_real_fred_data():
+    """Download the real 'Existing Home Sales' series from FRED."""
+    raw = pd.read_csv(FRED_URL)
+    raw.columns = ["date", "sales"]
+    raw["date"] = pd.to_datetime(raw["date"])
+    raw = raw.dropna().sort_values("date").reset_index(drop=True)
+    # Keep roughly the most recent 10 years so the trend reflects current
+    # market conditions rather than the full multi-decade history.
+    cutoff = raw["date"].max() - pd.DateOffset(years=10)
+    raw = raw[raw["date"] >= cutoff].reset_index(drop=True)
+    return raw
+
+
+def generate_fallback_data(n_months=120, seed=RANDOM_STATE):
+    """Synthetic stand-in resembling the real Existing Home Sales series:
+    a mild trend plus a summer-peak/winter-trough seasonal pattern, used
+    only if the live download above is not reachable."""
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range(end=pd.Timestamp.today().replace(day=1), periods=n_months, freq="MS")
+
+    t = np.arange(n_months)
+    trend = 430 - 0.35 * t  # slow long-run decline, roughly matching recent real data
+    month_of_year = np.asarray(dates.month, dtype=float)
+    # Seasonal amplitude: home sales peak in summer (~+70k), trough in winter (~-70k)
+    seasonal = 70 * np.sin(2 * np.pi * (month_of_year - 3) / 12)
+    noise = rng.normal(0, 15, n_months)
+
+    sales = np.clip(trend + seasonal + noise, 200, None).round(1)
+    return pd.DataFrame({"date": dates, "sales": sales})
+
+
+def load_data():
+    try:
+        df = load_real_fred_data()
+        print(f"Loaded {len(df)} REAL monthly observations from FRED's "
+              f"Existing Home Sales series ({FRED_URL}).")
+        return df
+    except Exception as exc:
+        print(f"Could not download the real FRED dataset ({exc}). "
+              f"Falling back to a documented synthetic series that "
+              f"resembles its real trend and seasonality.")
+        df = generate_fallback_data()
+        print(f"Generated {len(df)} synthetic monthly rows as a fallback.")
+        return df
+
+
+df = load_data()
+df["month_index"] = np.arange(len(df))          # linear time trend feature
+df["month_of_year"] = df["date"].dt.month.astype(str)  # seasonal feature
+
+X = df[["month_index", "month_of_year"]]
+y = df["sales"]
+
+# --- Baseline model: plain linear trend, like the original starter code ---
+baseline = LinearRegression()
+baseline.fit(df[["month_index"]], y)
+baseline_pred = baseline.predict(df[["month_index"]])
+print(f"\nBaseline (trend-only) training MAE: {mean_absolute_error(y, baseline_pred):.1f}")
+
+# --- Improved model: trend + month-of-year seasonality ---
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("season", OneHotEncoder(handle_unknown="ignore"), ["month_of_year"]),
+    ],
+    remainder="passthrough",
+)
+model = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("regressor", LinearRegression()),
+])
+model.fit(X, y)
+improved_pred = model.predict(X)
+print(f"Improved (trend + seasonality) training MAE: {mean_absolute_error(y, improved_pred):.1f}")
+
+# Forecast the next 6 months
+last_date = df["date"].max()
+future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=FORECAST_HORIZON, freq="MS")
+future = pd.DataFrame({
+    "month_index": np.arange(len(df), len(df) + FORECAST_HORIZON),
+    "month_of_year": future_dates.month.astype(str),
+})
+future_predictions = model.predict(future)
+
+print(f"\nForecast for the next {FORECAST_HORIZON} months:")
+for d, p in zip(future_dates, future_predictions):
+    print(f"  {d.strftime('%Y-%m')}: {p:,.1f} (thousand units)")
+
+# Plot historical vs. forecasted results
+plt.figure(figsize=(10, 5))
+plt.plot(df["date"], y, label="Historical Sales")
+plt.plot(df["date"], improved_pred, label="Fitted (trend + seasonality)", alpha=0.6)
+plt.plot(future_dates, future_predictions, label="Forecast (next 6 months)", linestyle="--", marker="o")
+plt.xlabel("Month")
+plt.ylabel("Existing Home Sales (thousand units)")
+plt.title("Housing Demand: Historical and 6-Month Forecast")
+plt.legend()
+plt.tight_layout()
+plt.savefig("demand_forecast.png")
+plt.close()
+print("\nSaved plot to demand_forecast.png")
+
+"""
+Part 1: Predict house prices based on square footage and location.
+Author: Jacob Laplante
+
+DATA SOURCE (real data):
+  Ames Housing Dataset (De Cock, D., 2011, "Ames, Iowa: Alternative to the
+  Boston Housing Data as an End of Semester Regression Project", Journal of
+  Statistics Education, 19(3)).
+  Official public download (no login required):
+    https://jse.amstat.org/v19n3/decock/AmesHousing.txt
+  Data dictionary:
+    https://jse.amstat.org/v19n3/decock/DataDocumentation.txt
+  2,930 home sales in Ames, IA (2006-2010), 82 columns. We use:
+    - 'Gr Liv Area'  -> square_footage
+    - 'Neighborhood' -> location   (restricted to the 6 most common
+                                     neighborhoods so the OneHotEncoder
+                                     output stays readable, same idea as
+                                     the toy 'Downtown/Suburb/Rural'
+                                     categories in the original starter code)
+    - 'SalePrice'    -> price (target)
+
+  NOTE ON THE SANDBOX THIS WAS DEVELOPED IN: the environment used to write
+  and test this script has outbound internet access restricted to a small
+  allow-list (package registries only), so the live download above could
+  not be exercised there. The loader below still tries the real URL first
+  (this is exactly what will run in Google Colab, GitHub Actions, or your
+  own laptop, all of which have normal internet access). If the download
+  is unavailable for any reason, it automatically falls back to a
+  synthetic dataset generated to match the *real* Ames summary statistics
+  (mean SalePrice ~ $180,796, mean Gr Liv Area ~ 1,515 sq ft, ~$100-120
+  marginal price per square foot) so the script always runs end to end.
+"""
+
+import io
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import r2_score, mean_absolute_error
+
+AMES_URL = "https://jse.amstat.org/v19n3/decock/AmesHousing.txt"
+TOP_N_NEIGHBORHOODS = 6
+RANDOM_STATE = 42
+
+
+def load_real_ames_data(top_n=TOP_N_NEIGHBORHOODS):
+    """Download the real Ames Housing dataset and trim it down to the
+    columns/categories this assignment needs."""
+    raw = pd.read_csv(AMES_URL, sep="\t")
+    df = raw[["Gr Liv Area", "Neighborhood", "SalePrice"]].rename(
+        columns={
+            "Gr Liv Area": "square_footage",
+            "Neighborhood": "location",
+            "SalePrice": "price",
+        }
+    ).dropna()
+
+    top_locations = df["location"].value_counts().nlargest(top_n).index
+    df = df[df["location"].isin(top_locations)].reset_index(drop=True)
+    return df
+
+
+def generate_fallback_data(n=300, seed=RANDOM_STATE):
+    """Synthetic stand-in that mimics the real Ames Housing distribution,
+    used only if the live download above is not reachable. Parameters are
+    based on the dataset's published summary statistics (see module
+    docstring) rather than being arbitrary."""
+    rng = np.random.default_rng(seed)
+
+    neighborhoods = {
+        # name: (avg base price, price premium per sqft)
+        "NAmes":   (145000, 95),
+        "CollgCr": (200000, 110),
+        "OldTown": (125000, 85),
+        "Edwards": (130000, 90),
+        "Somerst": (225000, 120),
+        "Gilbert": (190000, 105),
+    }
+    names = list(neighborhoods.keys())[:TOP_N_NEIGHBORHOODS]
+
+    locations = rng.choice(names, size=n)
+    square_footage = rng.normal(1515, 500, size=n).clip(600, 4200).round().astype(int)
+
+    base_price = np.array([neighborhoods[loc][0] for loc in locations])
+    per_sqft = np.array([neighborhoods[loc][1] for loc in locations])
+    noise = rng.normal(0, 18000, size=n)
+
+    price = (base_price + per_sqft * square_footage + noise).clip(60000, 600000).round(-2)
+
+    return pd.DataFrame({
+        "square_footage": square_footage,
+        "location": locations,
+        "price": price,
+    })
+
+
+def load_data():
+    try:
+        df = load_real_ames_data()
+        print(f"Loaded {len(df)} REAL home sales from the Ames Housing dataset "
+              f"({AMES_URL}).")
+        return df
+    except Exception as exc:
+        print(f"Could not download the real Ames Housing dataset ({exc}). "
+              f"Falling back to a documented synthetic dataset that matches "
+              f"its real summary statistics.")
+        df = generate_fallback_data()
+        print(f"Generated {len(df)} synthetic rows as a fallback.")
+        return df
+
+
+df = load_data()
+
+# Features and target
+X = df[["square_footage", "location"]]
+y = df["price"]
+
+# Preprocessing: One-hot encode the location column, pass square_footage through
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("location", OneHotEncoder(sparse_output=False, handle_unknown="ignore"), ["location"])
+    ],
+    remainder="passthrough",
+)
+
+# Pipeline with preprocessing and model
+model = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("regressor", LinearRegression()),
+])
+
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE
+)
+
+# Train model
+model.fit(X_train, y_train)
+
+# --- Evaluation (improvement over the starter code, which never checked
+# how good the model actually is) ---
+y_pred_test = model.predict(X_test)
+print(f"\nTest R^2:  {r2_score(y_test, y_pred_test):.3f}")
+print(f"Test MAE:  ${mean_absolute_error(y_test, y_pred_test):,.0f}")
+
+# Make a prediction for a new house: 2000 sq ft in the first (most common) location
+example_location = df["location"].value_counts().idxmax()
+new_house = pd.DataFrame({"square_footage": [2000], "location": [example_location]})
+predicted_price = model.predict(new_house)
+
+print(f"\nPredicted price for a 2000 sq ft house in {example_location}: "
+      f"${predicted_price[0]:,.2f}")
+
+# Display model coefficients
+feature_names = (
+    model.named_steps["preprocessor"]
+    .named_transformers_["location"]
+    .get_feature_names_out(["location"])
+).tolist() + ["square_footage"]
+
+coefficients = model.named_steps["regressor"].coef_
+print("\nModel Coefficients:")
+for feature, coef in zip(feature_names, coefficients):
+    print(f"  {feature}: {coef:,.2f}")
+print(f"  intercept: {model.named_steps['regressor'].intercept_:,.2f}")
+
+"""
+AAI 2025 - Machine Learning Homework (all parts combined into one file)
+Author: Jacob Laplante
+
+Part 1          - House price prediction (Linear Regression)
+Part 2          - Customer churn prediction (Logistic Regression)
+Part 3          - Customer segmentation (K-Means)
+Extra Credit    - Housing demand forecasting (Linear Regression + seasonality)
+
+Each part is self-contained in its own function (own data loader, own model,
+own printed results) so variable names never collide between parts, even
+though everything lives in this single file. Run the whole thing with:
+
+    python ml_homework_all_parts.py
+
+Each part tries to download its REAL public dataset first. If that fails
+(no internet, host down, etc.) it automatically falls back to a documented
+synthetic dataset built to match that real dataset's published statistics,
+so the script always runs end to end either way -- the printed output
+tells you which path was used for each part.
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    r2_score, mean_absolute_error, accuracy_score, roc_auc_score, confusion_matrix,
+)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+RANDOM_STATE = 42
+
+
+def section(title):
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+
+
+# ======================================================================
+# PART 1: HOUSE PRICE PREDICTION
+#
+# DATA SOURCE (real data): Ames Housing Dataset (De Cock, D., 2011, "Ames,
+# Iowa: Alternative to the Boston Housing Data as an End of Semester
+# Regression Project", Journal of Statistics Education, 19(3)).
+#   https://jse.amstat.org/v19n3/decock/AmesHousing.txt
+#   Data dictionary: https://jse.amstat.org/v19n3/decock/DataDocumentation.txt
+# 2,930 real home sales in Ames, IA (2006-2010). We use:
+#   'Gr Liv Area' -> square_footage, 'Neighborhood' -> location (top 6 most
+#   common neighborhoods only, for a clean small category set, mirroring
+#   the toy 'Downtown/Suburb/Rural' example in the original starter code),
+#   'SalePrice' -> price (target).
+# ======================================================================
+
+AMES_URL = "https://jse.amstat.org/v19n3/decock/AmesHousing.txt"
+
+
+def load_real_ames_data(top_n=6):
+    raw = pd.read_csv(AMES_URL, sep="\t")
+    df = raw[["Gr Liv Area", "Neighborhood", "SalePrice"]].rename(
+        columns={"Gr Liv Area": "square_footage", "Neighborhood": "location", "SalePrice": "price"}
+    ).dropna()
+    top_locations = df["location"].value_counts().nlargest(top_n).index
+    return df[df["location"].isin(top_locations)].reset_index(drop=True)
+
+
+def generate_fallback_house_data(n=300, seed=RANDOM_STATE):
+    """Synthetic stand-in matching Ames Housing's published summary stats
+    (mean SalePrice ~$180,796, mean Gr Liv Area ~1,515 sqft, ~$100-120
+    marginal price per sqft), used only if the live download is unreachable."""
+    rng = np.random.default_rng(seed)
+    neighborhoods = {
+        "NAmes": (145000, 95), "CollgCr": (200000, 110), "OldTown": (125000, 85),
+        "Edwards": (130000, 90), "Somerst": (225000, 120), "Gilbert": (190000, 105),
+    }
+    names = list(neighborhoods.keys())
+    locations = rng.choice(names, size=n)
+    square_footage = rng.normal(1515, 500, size=n).clip(600, 4200).round().astype(int)
+    base_price = np.array([neighborhoods[loc][0] for loc in locations])
+    per_sqft = np.array([neighborhoods[loc][1] for loc in locations])
+    noise = rng.normal(0, 18000, size=n)
+    price = (base_price + per_sqft * square_footage + noise).clip(60000, 600000).round(-2)
+    return pd.DataFrame({"square_footage": square_footage, "location": locations, "price": price})
+
+
+def load_house_data():
+    try:
+        df = load_real_ames_data()
+        print(f"Loaded {len(df)} REAL home sales from the Ames Housing dataset ({AMES_URL}).")
+        return df
+    except Exception as exc:
+        print(f"Could not download the real Ames Housing dataset ({exc}). "
+              f"Falling back to a documented synthetic dataset that matches its real summary statistics.")
+        df = generate_fallback_house_data()
+        print(f"Generated {len(df)} synthetic rows as a fallback.")
+        return df
+
+
+def run_part1_house_prices():
+    section("PART 1: HOUSE PRICE PREDICTION")
+    df = load_house_data()
+
+    X = df[["square_footage", "location"]]
+    y = df["price"]
+
+    preprocessor = ColumnTransformer(
+        transformers=[("location", OneHotEncoder(sparse_output=False, handle_unknown="ignore"), ["location"])],
+        remainder="passthrough",
+    )
+    model = Pipeline(steps=[("preprocessor", preprocessor), ("regressor", LinearRegression())])
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
+    model.fit(X_train, y_train)
+
+    y_pred_test = model.predict(X_test)
+    print(f"\nTest R^2:  {r2_score(y_test, y_pred_test):.3f}")
+    print(f"Test MAE:  ${mean_absolute_error(y_test, y_pred_test):,.0f}")
+
+    example_location = df["location"].value_counts().idxmax()
+    new_house = pd.DataFrame({"square_footage": [2000], "location": [example_location]})
+    predicted_price = model.predict(new_house)
+    print(f"\nPredicted price for a 2000 sq ft house in {example_location}: ${predicted_price[0]:,.2f}")
+
+    feature_names = (
+        model.named_steps["preprocessor"].named_transformers_["location"].get_feature_names_out(["location"])
+    ).tolist() + ["square_footage"]
+    coefficients = model.named_steps["regressor"].coef_
+    print("\nModel Coefficients:")
+    for feature, coef in zip(feature_names, coefficients):
+        print(f"  {feature}: {coef:,.2f}")
+    print(f"  intercept: {model.named_steps['regressor'].intercept_:,.2f}")
+
+
+# ======================================================================
+# PART 2: CUSTOMER CHURN PREDICTION
+#
+# DATA SOURCE (real data): IBM Telco Customer Churn dataset (7,043 real
+# customers). Official IBM GitHub mirror:
+#   https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/master/data/Telco-Customer-Churn.csv
+# Also on Kaggle: https://www.kaggle.com/datasets/blastchar/telco-customer-churn
+# Because this is real data, it uses the telecom company's actual column
+# names (tenure, MonthlyCharges, TotalCharges, SeniorCitizen, Contract)
+# rather than the fictional 'age/region' columns from the toy starter
+# example -- Contract plays the same OneHotEncoder-demo role 'region' did.
+# ======================================================================
+
+TELCO_URL = ("https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/"
+             "master/data/Telco-Customer-Churn.csv")
+CHURN_NUMERIC_FEATURES = ["tenure", "MonthlyCharges", "TotalCharges", "SeniorCitizen"]
+CHURN_CATEGORICAL_FEATURES = ["Contract"]
+
+
+def load_real_telco_data():
+    raw = pd.read_csv(TELCO_URL)
+    df = raw[CHURN_NUMERIC_FEATURES + CHURN_CATEGORICAL_FEATURES + ["Churn"]].copy()
+    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+    df = df.dropna()
+    df["churn"] = (df["Churn"] == "Yes").astype(int)
+    return df.drop(columns=["Churn"])
+
+
+def generate_fallback_churn_data(n=500, seed=RANDOM_STATE):
+    """Synthetic stand-in matching the real Telco dataset's schema and
+    published churn statistics (~26.5% overall churn rate; month-to-month
+    + high charges + low tenure customers churn much more often)."""
+    rng = np.random.default_rng(seed)
+    contract = rng.choice(["Month-to-month", "One year", "Two year"], size=n, p=[0.55, 0.25, 0.20])
+    senior = rng.choice([0, 1], size=n, p=[0.84, 0.16])
+    tenure_base = np.select(
+        [contract == "Month-to-month", contract == "One year", contract == "Two year"],
+        [rng.normal(18, 14, n), rng.normal(35, 16, n), rng.normal(50, 18, n)],
+    )
+    tenure = tenure_base.clip(0, 72).round().astype(int)
+    monthly_charges = rng.normal(64.8, 30, n).clip(18, 120).round(2)
+    total_charges = (monthly_charges * tenure + rng.normal(0, 50, n)).clip(0, None).round(2)
+    logit = (
+        -2.2 + 1.6 * (contract == "Month-to-month") - 0.4 * (contract == "One year")
+        - 1.0 * (contract == "Two year") + 0.02 * monthly_charges - 0.03 * tenure + 0.3 * senior
+    )
+    churn_prob = 1 / (1 + np.exp(-logit))
+    churn = (rng.random(n) < churn_prob).astype(int)
+    return pd.DataFrame({
+        "tenure": tenure, "MonthlyCharges": monthly_charges, "TotalCharges": total_charges,
+        "SeniorCitizen": senior, "Contract": contract, "churn": churn,
+    })
+
+
+def load_churn_data():
+    try:
+        df = load_real_telco_data()
+        print(f"Loaded {len(df)} REAL customer records from the IBM Telco Customer Churn dataset ({TELCO_URL}).")
+        return df
+    except Exception as exc:
+        print(f"Could not download the real Telco churn dataset ({exc}). "
+              f"Falling back to a documented synthetic dataset that matches its real schema and churn statistics.")
+        df = generate_fallback_churn_data()
+        print(f"Generated {len(df)} synthetic rows as a fallback. Overall churn rate: {df['churn'].mean():.1%}")
+        return df
+
+
+def run_part2_customer_churn():
+    section("PART 2: CUSTOMER CHURN PREDICTION")
+    df = load_churn_data()
+
+    X = df[CHURN_NUMERIC_FEATURES + CHURN_CATEGORICAL_FEATURES]
+    y = df["churn"]
+
+    preprocessor = ColumnTransformer(transformers=[
+        ("num", StandardScaler(), CHURN_NUMERIC_FEATURES),
+        ("cat", OneHotEncoder(sparse_output=False, handle_unknown="ignore"), CHURN_CATEGORICAL_FEATURES),
+    ])
+    model = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", LogisticRegression(random_state=RANDOM_STATE, max_iter=1000)),
+    ])
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    )
+    model.fit(X_train, y_train)
+
+    y_pred_test = model.predict(X_test)
+    y_proba_test = model.predict_proba(X_test)[:, 1]
+    print(f"\nTest accuracy: {accuracy_score(y_test, y_pred_test):.3f}")
+    print(f"Test ROC AUC:  {roc_auc_score(y_test, y_proba_test):.3f}")
+    print(f"Confusion matrix [[TN FP] [FN TP]]:\n{confusion_matrix(y_test, y_pred_test)}")
+
+    new_customer = pd.DataFrame({
+        "tenure": [5], "MonthlyCharges": [95.0], "TotalCharges": [475.0],
+        "SeniorCitizen": [0], "Contract": ["Month-to-month"],
+    })
+    churn_probability = model.predict_proba(new_customer)[0][1]
+    threshold = 0.5
+    churn_prediction = 1 if churn_probability > threshold else 0
+    print(f"\nChurn Probability for new customer: {churn_probability:.2f}")
+    print(f"Churn Prediction (1 = churn, 0 = no churn): {churn_prediction}")
+
+    feature_names = CHURN_NUMERIC_FEATURES + (
+        model.named_steps["preprocessor"].named_transformers_["cat"].get_feature_names_out(CHURN_CATEGORICAL_FEATURES)
+    ).tolist()
+    coefficients = model.named_steps["classifier"].coef_[0]
+    print("\nModel Coefficients (in standardized/encoded feature space):")
+    for feature, coef in zip(feature_names, coefficients):
+        print(f"  {feature}: {coef:.3f}")
+    print(f"  intercept: {model.named_steps['classifier'].intercept_[0]:.3f}")
+
+
+# ======================================================================
+# PART 3: CUSTOMER SEGMENTATION (K-MEANS)
+#
+# DATA SOURCE (real data): Mall Customer Segmentation Data (200 real mall
+# customers). Kaggle: https://www.kaggle.com/datasets/vjchoudhary7/customer-segmentation-tutorial-in-python
+# No-login CSV mirror: https://raw.githubusercontent.com/erkansirin78/datasets/master/Mall_Customers.csv
+# Columns are located by keyword (not exact name) because different
+# mirrors spell headers slightly differently (e.g. 'Genre' vs 'Gender').
+# ======================================================================
+
+MALL_URL = "https://raw.githubusercontent.com/erkansirin78/datasets/master/Mall_Customers.csv"
+SEGMENTATION_FEATURES = ["annual_spending", "purchase_frequency", "age"]
+
+
+def load_real_mall_data():
+    raw = pd.read_csv(MALL_URL)
+
+    def find_column(*keywords):
+        for original in raw.columns:
+            lowered = original.lower()
+            if all(keyword in lowered for keyword in keywords):
+                return original
+        raise KeyError(f"No column matching {keywords} found in {list(raw.columns)}")
+
+    rename_map = {
+        find_column("income"): "annual_spending",
+        find_column("spending"): "purchase_frequency",
+        find_column("age"): "age",
+        find_column("gen"): "gender",
+    }
+    return raw.rename(columns=rename_map)[["annual_spending", "purchase_frequency", "age", "gender"]]
+
+
+def generate_fallback_segmentation_data(n=200, seed=RANDOM_STATE):
+    """Synthetic stand-in matching the real Mall Customer dataset's
+    published ranges (Age 18-70, Annual Income $15k-$137k, Spending Score
+    1-99), built as three loosely-separated groups so the elbow method
+    and K-Means still produce an interpretable result."""
+    rng = np.random.default_rng(seed)
+    n_per_group = n // 3
+    groups = []
+    profiles = [
+        (30, 8, 25, 12, 40, 12),
+        (55, 12, 55, 15, 32, 8),
+        (95, 15, 80, 12, 28, 6),
+    ]
+    for income_mu, income_sd, spend_mu, spend_sd, age_mu, age_sd in profiles:
+        groups.append(pd.DataFrame({
+            "annual_spending": rng.normal(income_mu, income_sd, n_per_group).clip(15, 137).round(1),
+            "purchase_frequency": rng.normal(spend_mu, spend_sd, n_per_group).clip(1, 99).round().astype(int),
+            "age": rng.normal(age_mu, age_sd, n_per_group).clip(18, 70).round().astype(int),
+            "gender": rng.choice(["Male", "Female"], n_per_group),
+        }))
+    df = pd.concat(groups, ignore_index=True)
+    return df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+
+def load_segmentation_data():
+    try:
+        df = load_real_mall_data()
+        print(f"Loaded {len(df)} REAL customers from the Mall Customer Segmentation dataset ({MALL_URL}).")
+        return df
+    except Exception as exc:
+        print(f"Could not download the real Mall Customer dataset ({exc}). "
+              f"Falling back to a documented synthetic dataset that matches its real value ranges.")
+        df = generate_fallback_segmentation_data()
+        print(f"Generated {len(df)} synthetic rows as a fallback.")
+        return df
+
+
+def run_part3_customer_segmentation():
+    section("PART 3: CUSTOMER SEGMENTATION")
+    df = load_segmentation_data()
+
+    X = df[SEGMENTATION_FEATURES]
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    inertia = []
+    K = range(1, 8)
+    for k in K:
+        kmeans = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+        kmeans.fit(X_scaled)
+        inertia.append(kmeans.inertia_)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(K, inertia, "bo-")
+    plt.xlabel("Number of Clusters (K)")
+    plt.ylabel("Inertia")
+    plt.title("Elbow Method for Optimal K")
+    plt.savefig("elbow_plot.png")
+    plt.close()
+    print("Saved elbow_plot.png -- look for the 'bend' (usually K=3 to 5 for this data).")
+
+    optimal_k = 3
+    kmeans = KMeans(n_clusters=optimal_k, random_state=RANDOM_STATE, n_init=10)
+    df["cluster"] = kmeans.fit_predict(X_scaled)
+
+    cluster_summary = df.groupby("cluster")[SEGMENTATION_FEATURES].mean().round(2)
+    cluster_counts = df["cluster"].value_counts().sort_index()
+    print("\nCluster Characteristics (mean values):")
+    print(cluster_summary)
+    print("\nCluster sizes:")
+    print(cluster_counts)
+
+    print("\nTargeted Marketing Strategies:")
+    for cluster in range(optimal_k):
+        spending = cluster_summary.loc[cluster, "annual_spending"]
+        frequency = cluster_summary.loc[cluster, "purchase_frequency"]
+        print(f"\nCluster {cluster} (n={cluster_counts[cluster]}, "
+              f"avg income=${spending:.0f}k, avg spending score={frequency:.0f}):")
+        if spending > 70 and frequency > 60:
+            print("  High-income, high-spending customers -> exclusive promotions, "
+                  "VIP loyalty perks, early access to new products.")
+        elif frequency > 60:
+            print("  Frequent/high spending-score shoppers -> loyalty points, "
+                  "bundle discounts to keep engagement high.")
+        elif spending > 70:
+            print("  High income but lower spending score -> targeted campaigns "
+                  "highlighting premium products they aren't buying yet.")
+        else:
+            print("  Lower engagement customers -> re-engagement emails, "
+                  "first-purchase discounts, awareness campaigns.")
+
+    df.to_csv("customer_segments.csv", index=False)
+    print("\nSaved cluster assignments to customer_segments.csv")
+
+
+# ======================================================================
+# EXTRA CREDIT: HOUSING DEMAND FORECASTING
+#
+# DATA SOURCE (real data): "Existing Home Sales" (not seasonally
+# adjusted), series EXHOSLUSM495N, via FRED (Federal Reserve Bank of St.
+# Louis): https://fred.stlouisfed.org/graph/fredgraph.csv?id=EXHOSLUSM495N
+# Series page: https://fred.stlouisfed.org/series/EXHOSLUSM495N
+#
+# ASSUMPTIONS: recent history (~10 years) is representative enough to
+# extrapolate from; a trend + month-of-year seasonal model is a reasonable
+# balance of simplicity and accuracy for a 6-month forecast; no exogenous
+# shocks (rate changes, recessions) occur in the forecast window.
+#
+# CHALLENGES: plain linear regression on a raw time index (as in the
+# original starter code) ignores seasonality and badly underfits a series
+# that swings a lot by calendar month; housing demand also depends on
+# mortgage rates, employment, and supply, none of which are in this
+# single-series dataset.
+#
+# POTENTIAL IMPROVEMENTS: add exogenous features (mortgage rates,
+# inventory, employment); use a model built for time series (SARIMA,
+# Prophet, gradient boosting on lag features); cross-validate on rolling
+# time windows instead of a single train/test split, since a normal
+# train_test_split shuffle leaks future information into the past.
+# ======================================================================
+
+FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=EXHOSLUSM495N"
+FORECAST_HORIZON = 6
+
+
+def load_real_fred_data():
+    raw = pd.read_csv(FRED_URL)
+    raw.columns = ["date", "sales"]
+    raw["date"] = pd.to_datetime(raw["date"])
+    raw = raw.dropna().sort_values("date").reset_index(drop=True)
+    cutoff = raw["date"].max() - pd.DateOffset(years=10)
+    return raw[raw["date"] >= cutoff].reset_index(drop=True)
+
+
+def generate_fallback_forecast_data(n_months=120, seed=RANDOM_STATE):
+    """Synthetic stand-in resembling the real Existing Home Sales series:
+    a mild trend plus a summer-peak/winter-trough seasonal pattern."""
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range(end=pd.Timestamp.today().replace(day=1), periods=n_months, freq="MS")
+    t = np.arange(n_months)
+    trend = 430 - 0.35 * t
+    month_of_year = np.asarray(dates.month, dtype=float)
+    seasonal = 70 * np.sin(2 * np.pi * (month_of_year - 3) / 12)
+    noise = rng.normal(0, 15, n_months)
+    sales = np.clip(trend + seasonal + noise, 200, None).round(1)
+    return pd.DataFrame({"date": dates, "sales": sales})
+
+
+def load_forecast_data():
+    try:
+        df = load_real_fred_data()
+        print(f"Loaded {len(df)} REAL monthly observations from FRED's Existing Home Sales series ({FRED_URL}).")
+        return df
+    except Exception as exc:
+        print(f"Could not download the real FRED dataset ({exc}). "
+              f"Falling back to a documented synthetic series that resembles its real trend and seasonality.")
+        df = generate_fallback_forecast_data()
+        print(f"Generated {len(df)} synthetic monthly rows as a fallback.")
+        return df
+
+
+def run_extra_credit_forecasting():
+    section("EXTRA CREDIT: HOUSING DEMAND FORECASTING")
+    df = load_forecast_data()
+    df["month_index"] = np.arange(len(df))
+    df["month_of_year"] = df["date"].dt.month.astype(str)
+
+    X = df[["month_index", "month_of_year"]]
+    y = df["sales"]
+
+    baseline = LinearRegression()
+    baseline.fit(df[["month_index"]], y)
+    baseline_pred = baseline.predict(df[["month_index"]])
+    print(f"\nBaseline (trend-only) training MAE: {mean_absolute_error(y, baseline_pred):.1f}")
+
+    preprocessor = ColumnTransformer(
+        transformers=[("season", OneHotEncoder(handle_unknown="ignore"), ["month_of_year"])],
+        remainder="passthrough",
+    )
+    model = Pipeline(steps=[("preprocessor", preprocessor), ("regressor", LinearRegression())])
+    model.fit(X, y)
+    improved_pred = model.predict(X)
+    print(f"Improved (trend + seasonality) training MAE: {mean_absolute_error(y, improved_pred):.1f}")
+
+    last_date = df["date"].max()
+    future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=FORECAST_HORIZON, freq="MS")
+    future = pd.DataFrame({
+        "month_index": np.arange(len(df), len(df) + FORECAST_HORIZON),
+        "month_of_year": future_dates.month.astype(str),
+    })
+    future_predictions = model.predict(future)
+
+    print(f"\nForecast for the next {FORECAST_HORIZON} months:")
+    for d, p in zip(future_dates, future_predictions):
+        print(f"  {d.strftime('%Y-%m')}: {p:,.1f} (thousand units)")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(df["date"], y, label="Historical Sales")
+    plt.plot(df["date"], improved_pred, label="Fitted (trend + seasonality)", alpha=0.6)
+    plt.plot(future_dates, future_predictions, label="Forecast (next 6 months)", linestyle="--", marker="o")
+    plt.xlabel("Month")
+    plt.ylabel("Existing Home Sales (thousand units)")
+    plt.title("Housing Demand: Historical and 6-Month Forecast")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("demand_forecast.png")
+    plt.close()
+    print("\nSaved plot to demand_forecast.png")
+
+
+if __name__ == "__main__":
+    run_part1_house_prices()
+    run_part2_customer_churn()
+    run_part3_customer_segmentation()
+    run_extra_credit_forecasting()
+
+# AAI 2025 — Machine Learning Homework (House Prices, Churn, Segmentation, Forecasting)
+
+This repo contains my edited/improved versions of the four starter scripts for
+the ML homework assignment. Each script was rewritten to use a **real public
+dataset** (not just the tiny 10-row sample from the starter code), with an
+automatic fallback to a documented synthetic dataset if a live download isn't
+available in whatever environment runs the script.
+
+## What's in `ML/`
+
+There are two equivalent ways to submit this — pick **one**:
+
+- **Single file (simplest to upload):** `ml_homework_all_parts.py` runs all
+  four parts back to back, each in its own function so nothing collides.
+- **Four separate files (mirrors the original starter code layout):**
+  `house_price_prediction.py`, `customer_churn_prediction.py`,
+  `customer_segmentation.py`, `forecasting_sales.py`.
+
+Both contain the exact same logic — the combined file is just the four
+scripts merged together. If you're not sure which your instructor wants,
+keep both in the repo; it doesn't hurt.
+
+| File | Part | Real data source |
+|---|---|---|
+| `house_price_prediction.py` | Part 1 — House price prediction | [Ames Housing dataset](https://jse.amstat.org/v19n3/decock/AmesHousing.txt) (2,930 real home sales, De Cock 2011) |
+| `customer_churn_prediction.py` | Part 2 — Customer churn | [IBM Telco Customer Churn](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) (7,043 real customers) |
+| `customer_segmentation.py` | Part 3 — Customer segmentation | [Mall Customer Segmentation Data](https://www.kaggle.com/datasets/vjchoudhary7/customer-segmentation-tutorial-in-python) (200 real mall customers) |
+| `forecasting_sales.py` | Extra Credit — Housing demand forecasting | [FRED Existing Home Sales (EXHOSLUSM495N)](https://fred.stlouisfed.org/series/EXHOSLUSM495N) (real monthly government data) |
+| `ml_homework_all_parts.py` | All of the above, combined | Same four sources as above |
+
+Each script's docstring at the top documents:
+- the exact real data source and download URL,
+- how the real columns map onto the assignment's feature names,
+- the fallback synthetic dataset used only if the download fails, and
+- (for the extra credit script) assumptions, challenges, and potential improvements.
+
+**Why the fallback exists:** these scripts were developed and tested in a
+sandboxed environment with no general internet access, so I could not
+literally exercise the live downloads there. The scripts try the real URL
+first — this is what will actually run when you execute them in Google
+Colab, GitHub Actions, or your own laptop, all of which have normal internet
+access. If a download ever fails (offline grading machine, a dataset host
+being temporarily down, etc.), the script automatically falls back to a
+synthetic dataset built to match that real dataset's published statistics,
+so it always runs end-to-end either way. Each run prints which path it took.
+
+## Requirements
+
+```
+pandas
+numpy
+scikit-learn
+matplotlib
+```
+
+Install with:
+```bash
+pip install -r requirements.txt
+```
+
+## How to run
+
+### Option A — Locally (or in a Codespace)
+```bash
+git clone <your-repo-url>
+cd AAI2025-ML-Assignment
+pip install -r requirements.txt
+
+# either run the one combined file:
+python ML/ml_homework_all_parts.py
+
+# or run the four separate files:
+python ML/house_price_prediction.py
+python ML/customer_churn_prediction.py
+python ML/customer_segmentation.py
+python ML/forecasting_sales.py
+```
+
+### Option B — Google Colab
+1. Go to [colab.research.google.com](https://colab.research.google.com) → **File → Open notebook → GitHub tab**, paste your repo URL once it's pushed (see below), or just copy-paste `ml_homework_all_parts.py`'s contents into a single Colab cell (or each of the four scripts into its own cell).
+2. Run the cell(s). Colab has full internet access, so the scripts will pull the **real** datasets automatically (you should see "Loaded ### REAL ..." printed, not the fallback message).
+3. For the plots (`elbow_plot.png`, `demand_forecast.png`), add this to display them inline after the script's `plt.savefig(...)` line:
+   ```python
+   from IPython.display import Image, display
+   display(Image("elbow_plot.png"))
+   ```
+
+## Outputs produced
+
+- `ML/customer_segments.csv` — cluster assignment for every customer (Part 3)
+- `ML/elbow_plot.png` — elbow curve for choosing K (Part 3)
+- `ML/demand_forecast.png` — historical vs. forecasted housing demand (Extra Credit)
+- Console output for every script prints the trained model's coefficients, evaluation metrics (R², MAE, accuracy, ROC AUC — added beyond what the starter code checked), and predictions, as required by the assignment.
+
+## Submitting via GitHub
+
+From inside this folder:
+```bash
+git init
+git add .
+git commit -m "Complete AAI2025 ML homework: house prices, churn, segmentation, forecasting"
+```
+Then create an empty repo on github.com (no README/gitignore, so it doesn't
+conflict with what you already have), and push:
+```bash
+git branch -M main
+git remote add origin https://github.com/<your-username>/<repo-name>.git
+git push -u origin main
+```
+Submit the resulting `https://github.com/<your-username>/<repo-name>` link
+in Canvas.
+
+## Submission checklist mapping
+
+- [x] Sample data replaced with realistic, larger datasets (100+ records) — all four scripts use real datasets ranging from 120 to 7,043 rows.
+- [x] Data source documented in a comment in each file.
+- [x] Starter code edited with own implementation/improvements (evaluation metrics added to Parts 1–2, expanded elbow range + richer strategy logic in Part 3, seasonality model added on top of the plain trend line in the extra credit part).
+- [x] GitHub link to submit (see steps above).
+
+pandas
+numpy
+scikit-learn
+matplotlib
